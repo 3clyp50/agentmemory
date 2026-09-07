@@ -20,6 +20,17 @@ class AgentMemorySession(Extension):
             f"{self.agent.context.id}:{session_number}",
         )
 
+        if not self.agent.get_data("agentmemory_boot_started"):
+            self.agent.set_data("agentmemory_boot_started", True)
+            import threading
+            from usr.plugins.agentmemory.helpers import server_manager
+            threading.Thread(
+                target=server_manager.ensure_server,
+                args=(self.agent,),
+                name="a0-agentmemory-server-heal",
+                daemon=True,
+            ).start()
+
         title = loop_data.user_message.output_text() if loop_data.user_message else ""
         try:
             result = await client.start_session(self.agent, title)
@@ -28,6 +39,53 @@ class AgentMemorySession(Extension):
                     "agent.extras.agentmemory_context.md",
                     context=result["context"],
                 )
+                # Surface pending cross-session work so the agent can
+                # proactively propose continuing it (propose, never start
+                # work without user confirmation).
+                try:
+                    frontier = await client.frontier(self.agent, limit=5)
+                    entries = frontier.get("frontier") or []
+                    if entries:
+                        lines = ["## AgentMemory pending actions (frontier)"]
+                        lines.append(
+                            "Open cross-session work items exist. Mention the "
+                            "most relevant ones when proposing next steps; "
+                            "propose, do not start them without user approval."
+                        )
+                        for entry in entries:
+                            action = entry.get("action") or {}
+                            lines.append(
+                                f"- p{action.get('priority', '?')} "
+                                f"{action.get('title', '?')} (id: {action.get('id', '?')})"
+                            )
+                        loop_data.extras_temporary["agentmemory_actions"] = "\n".join(lines)
+                except Exception:
+                    pass
+                # Inject pinned slots (persona, preferences, project
+                # context, guidance, pending items) so every session starts
+                # with the agent's durable self-knowledge. Only slots with
+                # non-empty content are included to keep context lean.
+                try:
+                    slots_result = await client.slots_list(self.agent)
+                    pinned = [
+                        slot
+                        for slot in slots_result.get("slots") or []
+                        if slot.get("pinned") and str(slot.get("content") or "").strip()
+                    ]
+                    if pinned:
+                        lines = ["## AgentMemory slots (pinned memory)"]
+                        lines.append(
+                            "Durable self-knowledge maintained across sessions. "
+                            "Treat as reference; update slots via the "
+                            "agentmemory_slots tool when they become stale."
+                        )
+                        for slot in pinned:
+                            label = slot.get("label", "?")
+                            content = str(slot.get("content") or "").strip()
+                            lines.append(f"### {label}\n{content}")
+                        loop_data.extras_temporary["agentmemory_slots"] = "\n".join(lines)
+                except Exception:
+                    pass
             if config["auto_capture"] and title.strip():
                 await client.observe(
                     self.agent,
